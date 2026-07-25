@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Data & checkpoints (jamais sur GitHub)
+*.pt
+*.pth
+data/
+results/*.csv
+results/*.npy
+*.edf
+*.fif

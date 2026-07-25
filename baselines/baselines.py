@@ -1,8 +1,14 @@
 """
-grn_balladeer.eval.baselines
+baselines.baselines
 =============================
-Module 10 (baselines) — provides a working evaluation harness
-(SVM, RF, theta/beta ratio) BEFORE starting on the GRN itself.
+Ported from grn-balladeer's eval/baselines.py (SVM, RF, band-power
+features, theta/beta ratio, subject-disjoint CV). The external
+`grn_balladeer.data.labels` dependency has been removed: this file is
+now fully self-contained -- `stratified_subject_kfold` is defined
+locally below instead of imported from the other repo's package,
+since importing across repos by package name broke previously (the
+grn-balladeer repo folder uses a hyphen while its internal imports
+assume an underscore).
 """
 
 from __future__ import annotations
@@ -19,10 +25,45 @@ from sklearn.metrics import (
     accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score,
     precision_recall_fscore_support, confusion_matrix, roc_curve,
 )
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
-from grn_balladeer.data.labels import stratified_subject_kfold
+
+def stratified_subject_kfold(
+    label_df: pd.DataFrame, k: int = 5, seed: int = 42
+) -> List[dict]:
+    """Split at the SUBJECT level, never at the epoch level. Stratified on
+    label + sex + age bin simultaneously, via a composite key.
+
+    Ported unchanged from grn-balladeer's data/labels.py, so that this
+    repo has no cross-repo package dependency.
+
+    Returns a list of {train_ids, val_ids} dicts of length k.
+    """
+    df = label_df.reset_index(drop=True).copy()
+    df["strata"] = (
+        df["label"].astype(str) + "_" + df["sex"].astype(str) + "_" + df["age_bin"].astype(str)
+    )
+
+    # Some strata may be too rare for StratifiedKFold(k) -- fall back to the
+    # "label"-only stratum for these subjects, to be documented.
+    counts = df["strata"].value_counts()
+    rare_strata = counts[counts < k].index
+    df.loc[df["strata"].isin(rare_strata), "strata"] = "rare_" + df.loc[
+        df["strata"].isin(rare_strata), "label"
+    ].astype(str)
+
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    folds = []
+    for train_idx, val_idx in skf.split(df, df["strata"]):
+        folds.append(
+            {
+                "train_ids": df.loc[train_idx, "user_id"].tolist(),
+                "val_ids": df.loc[val_idx, "user_id"].tolist(),
+            }
+        )
+    return folds
 
 # ---------------------------------------------------------------------------
 # Real confirmed channels (UB0004 file, Module 2a). Do not guess other

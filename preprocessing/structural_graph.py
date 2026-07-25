@@ -1,6 +1,13 @@
 """
-grn_balladeer.connectivity.structural_graph
+preprocessing.structural_graph
 ==============================================
+Ported unchanged from grn-balladeer's connectivity/structural_graph.py
+(dataset-agnostic: takes ch_names as a parameter, no dependency on the
+grn_balladeer package). Reused here to build the k-NN electrode graph
+for the graph-constrained variant of the adversarial channel-importance
+method (perturbing electrode neighborhoods rather than isolated
+electrodes).
+
 Structural (physical-distance) k-NN adjacency, precomputed ONCE from
 real electrode positions (MNE's standard_1020 montage), not recomputed
 per-epoch like PLV/PLI. This is the near-zero-inference-cost graph

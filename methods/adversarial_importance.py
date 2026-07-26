@@ -298,7 +298,7 @@ def compute_sample_importance(
     )
 
 
-def rank_channels(
+def compute_epsilon_matrix(
     model,
     X: np.ndarray,
     channel_names: List[str],
@@ -307,25 +307,20 @@ def rank_channels(
     seed: int = 42,
     use_feature_scale: bool = True,
     **search_kwargs,
-) -> "np.ndarray":
-    """Runs compute_sample_importance across (a subset of) X and
-    aggregates into a single per-channel importance ranking.
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """Shared engine behind rank_channels: runs the isolated
+    single-channel search for every (sampled subject, channel) pair and
+    returns the RAW per-subject matrix, without aggregating it away --
+    needed for subject-adaptive analysis (per_subject_top_k_channels,
+    subgroup_ranking_agreement), where the whole point is to look at
+    how the ranking varies across subjects/subgroups rather than
+    collapsing it into one global number.
 
-    model: any object with .predict(X) -> array of 0/1 (e.g. a fitted
-    sklearn RandomForestClassifier). Only .predict is used -- no
-    gradient, no .predict_proba dependency, so this works unchanged for
-    any black-box classifier.
-
-    use_feature_scale: if True (default), computes feature_scale as
-    X.std(axis=0) and passes it through so epsilon is comparable across
-    bands/channels of different natural amplitude (see
-    find_minimal_epsilon_for_channel's docstring for why this matters
-    on raw EEG band-power features). Set to False only if X has already
-    been standardized upstream (e.g. via sklearn's StandardScaler).
-
-    Returns a structured array with fields (channel_name, mean_epsilon,
-    median_epsilon, pct_censored, mean_importance), sorted by
-    mean_importance descending (most important channel first).
+    Returns (epsilon_matrix, censored_matrix, sample_indices):
+      - epsilon_matrix: (n_sampled_subjects, n_channels) float array
+      - censored_matrix: (n_sampled_subjects, n_channels) bool array
+      - sample_indices: (n_sampled_subjects,) int array, the row
+        indices into the original X that each matrix row corresponds to
     """
     n_samples = X.shape[0]
     if max_samples is not None and max_samples < n_samples:
@@ -355,9 +350,18 @@ def rank_channels(
             all_epsilons[row_i, c] = pc.epsilon
             all_censored[row_i, c] = pc.censored
 
-    mean_epsilon = all_epsilons.mean(axis=0)
-    median_epsilon = np.median(all_epsilons, axis=0)
-    pct_censored = all_censored.mean(axis=0)
+    return all_epsilons, all_censored, idx
+
+
+def _aggregate_epsilon_matrix(
+    epsilon_matrix: np.ndarray, censored_matrix: np.ndarray, channel_names: List[str]
+) -> "np.ndarray":
+    """Shared aggregation step (mean/median epsilon, pct censored,
+    mean importance) reused by rank_channels and
+    rank_channels_graph_constrained."""
+    mean_epsilon = epsilon_matrix.mean(axis=0)
+    median_epsilon = np.median(epsilon_matrix, axis=0)
+    pct_censored = censored_matrix.mean(axis=0)
     mean_importance = 1.0 / np.maximum(mean_epsilon, 1e-12)
 
     dtype = [
@@ -367,14 +371,120 @@ def rank_channels(
         ("pct_censored", "f8"),
         ("mean_importance", "f8"),
     ]
-    out = np.zeros(n_channels, dtype=dtype)
+    out = np.zeros(len(channel_names), dtype=dtype)
     out["channel_name"] = channel_names
     out["mean_epsilon"] = mean_epsilon
     out["median_epsilon"] = median_epsilon
     out["pct_censored"] = pct_censored
     out["mean_importance"] = mean_importance
-
     return np.sort(out, order="mean_importance")[::-1]
+
+
+def rank_channels(
+    model,
+    X: np.ndarray,
+    channel_names: List[str],
+    n_bands: int,
+    max_samples: Optional[int] = None,
+    seed: int = 42,
+    use_feature_scale: bool = True,
+    **search_kwargs,
+) -> "np.ndarray":
+    """Runs the isolated single-channel search across (a subset of) X
+    and aggregates into a single per-channel importance ranking.
+
+    model: any object with .predict(X) -> array of 0/1 (e.g. a fitted
+    sklearn RandomForestClassifier). Only .predict is used -- no
+    gradient, no .predict_proba dependency, so this works unchanged for
+    any black-box classifier.
+
+    use_feature_scale: if True (default), computes feature_scale as
+    X.std(axis=0) and passes it through so epsilon is comparable across
+    bands/channels of different natural amplitude (see
+    find_minimal_epsilon_for_channel's docstring for why this matters
+    on raw EEG band-power features). Set to False only if X has already
+    been standardized upstream (e.g. via sklearn's StandardScaler).
+
+    Returns a structured array with fields (channel_name, mean_epsilon,
+    median_epsilon, pct_censored, mean_importance), sorted by
+    mean_importance descending (most important channel first). For the
+    raw per-subject matrix instead of this aggregate, call
+    compute_epsilon_matrix directly.
+    """
+    epsilon_matrix, censored_matrix, _ = compute_epsilon_matrix(
+        model=model, X=X, channel_names=channel_names, n_bands=n_bands,
+        max_samples=max_samples, seed=seed, use_feature_scale=use_feature_scale,
+        **search_kwargs,
+    )
+    return _aggregate_epsilon_matrix(epsilon_matrix, censored_matrix, channel_names)
+
+
+def per_subject_top_k_channels(
+    epsilon_matrix: np.ndarray, channel_names: List[str], k: int = 5
+) -> List[List[str]]:
+    """The literal 'dynamic/subject-adaptive selection': for each
+    subject (row of epsilon_matrix, as returned by compute_epsilon_matrix),
+    returns that subject's own top-k channels by importance (smallest
+    epsilon = most important), rather than one fixed global top-k for
+    every subject.
+
+    Returns a list (length n_subjects) of lists of k channel names,
+    each subject's own ranking, most important first.
+    """
+    n_subjects = epsilon_matrix.shape[0]
+    out = []
+    for i in range(n_subjects):
+        order = np.argsort(epsilon_matrix[i])  # smallest epsilon = most important, first
+        top_k = [channel_names[c] for c in order[:k]]
+        out.append(top_k)
+    return out
+
+
+def subgroup_ranking_agreement(
+    epsilon_matrix: np.ndarray, group_labels: np.ndarray
+) -> "dict":
+    """Tests whether channel importance is uniform across subgroups, or
+    genuinely subgroup-dependent -- the same question this project
+    already asked of the RF's built-in feature_importances_ (Spearman
+    rho=0.004 between two demographic subgroups on BALLADEER, i.e.
+    near-zero agreement). Here we ask the identical question of the
+    adversarial epsilon-based ranking instead.
+
+    For every pair of distinct groups in `group_labels`, computes the
+    Spearman rank correlation between the two groups' mean-importance
+    channel rankings (mean epsilon per channel, restricted to that
+    group's rows of epsilon_matrix). A rho near 0 (or negative) means
+    the two subgroups rely on different channels -- evidence FOR
+    subject/subgroup-adaptive selection over one fixed global montage.
+    A rho near 1 means the groups agree -- evidence that a single fixed
+    montage is adequate and the adaptive variant adds complexity
+    without benefit for this particular split.
+
+    Returns {(group_a, group_b): spearman_rho} for every unordered pair
+    of distinct groups present in group_labels.
+    """
+    from scipy.stats import spearmanr
+
+    group_labels = np.asarray(group_labels)
+    unique_groups = sorted(set(group_labels.tolist()))
+    if len(unique_groups) < 2:
+        raise ValueError(
+            "subgroup_ranking_agreement: need at least 2 distinct groups in "
+            f"group_labels, got {unique_groups}."
+        )
+
+    mean_importance_per_group = {}
+    for g in unique_groups:
+        mask = group_labels == g
+        mean_epsilon_g = epsilon_matrix[mask].mean(axis=0)
+        mean_importance_per_group[g] = 1.0 / np.maximum(mean_epsilon_g, 1e-12)
+
+    results = {}
+    for i, g_a in enumerate(unique_groups):
+        for g_b in unique_groups[i + 1 :]:
+            rho, _ = spearmanr(mean_importance_per_group[g_a], mean_importance_per_group[g_b])
+            results[(g_a, g_b)] = float(rho)
+    return results
 
 
 def rank_channels_graph_constrained(

@@ -15,7 +15,13 @@ from __future__ import annotations
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 
-from methods.adversarial_importance import rank_channels, rank_channels_graph_constrained
+from methods.adversarial_importance import (
+    rank_channels,
+    rank_channels_graph_constrained,
+    compute_epsilon_matrix,
+    per_subject_top_k_channels,
+    subgroup_ranking_agreement,
+)
 
 
 def test_recovers_single_informative_channel_equal_scale():
@@ -156,6 +162,89 @@ def test_graph_constrained_beats_isolated_on_difference_interaction():
     )
 
 
+def test_subject_adaptive_detects_subgroup_dependent_importance():
+    """Two subgroups (A, B) rely on DIFFERENT channels for the same
+    task -- CH0 decides the label for group A, CH4 decides it for
+    group B, with CH5 acting as an implicit group indicator (mirroring
+    a real systematic subgroup difference, e.g. age-related EEG
+    amplitude, WITHOUT giving the model an explicit group label
+    feature). This directly parallels the project's own empirical
+    finding on the RF's built-in feature importances (Spearman
+    rho=0.004 between two demographic subgroups on BALLADEER) -- here
+    we ask the same question of the adversarial epsilon-based ranking.
+
+    IMPORTANT LESSON (documented from an earlier failed attempt at this
+    test): the epsilon matrix MUST be computed on held-out test points,
+    not training points. An unconstrained-depth RF trained on this kind
+    of task reaches 100% train accuracy by partly memorizing individual
+    training points via splits unrelated to the intended CH0/CH4 signal,
+    which fully masked the expected subgroup divergence (first attempt:
+    rho=0.86, no divergence). Evaluating on genuinely held-out test
+    points (with a shallow-enough model, max_depth=6, that actually
+    generalizes -- verified here via test accuracy > 0.95 per subgroup)
+    is what makes the subgroup divergence visible (rho drops to ~0.38,
+    and per-subject top-1 correctly diverges to CH0 for group A / CH4
+    for group B in the large majority of subjects).
+    """
+    from collections import Counter
+    from sklearn.model_selection import train_test_split
+
+    rng_seed = 4
+    np.random.seed(rng_seed)
+    n_channels, n_bands = 6, 1
+    channel_names = [f"CH{i}" for i in range(n_channels)]
+    n_per_group = 300
+    n_samples = 2 * n_per_group
+
+    X = np.random.randn(n_samples, n_channels * n_bands) * 1.0
+    group = np.array(["A"] * n_per_group + ["B"] * n_per_group)
+    X[:n_per_group, 5] += 5.0  # CH5 = implicit group indicator (A)
+    X[n_per_group:, 5] -= 5.0  # CH5 = implicit group indicator (B)
+
+    y = np.zeros(n_samples, dtype=int)
+    y[:n_per_group] = (X[:n_per_group, 0] > 0).astype(int)  # CH0 decides for group A
+    y[n_per_group:] = (X[n_per_group:, 4] > 0).astype(int)  # CH4 decides for group B
+
+    X_train, X_test, y_train, y_test, group_train, group_test = train_test_split(
+        X, y, group, test_size=0.5, random_state=42, stratify=y
+    )
+    clf = RandomForestClassifier(
+        n_estimators=300, max_depth=6, class_weight="balanced", random_state=42, n_jobs=-1
+    )
+    clf.fit(X_train, y_train)
+    for g in ["A", "B"]:
+        mask = group_test == g
+        assert clf.score(X_test[mask], y_test[mask]) > 0.95, (
+            f"sanity check: RF must genuinely generalize (not just memorize) "
+            f"the group-{g} rule on held-out test data"
+        )
+
+    eps_matrix, censored_matrix, idx = compute_epsilon_matrix(
+        model=clf, X=X_test, channel_names=channel_names, n_bands=n_bands,
+        max_samples=60, seed=42,
+        epsilon_init=0.05, growth_factor=1.5, max_epsilon=4.0, n_directions=15, n_refine_steps=6,
+    )
+    group_sampled = group_test[idx]
+
+    agreement = subgroup_ranking_agreement(eps_matrix, group_sampled)
+    rho_ab = agreement[("A", "B")]
+    assert rho_ab < 0.7, (
+        f"expected a clearly reduced Spearman agreement between subgroups relying on "
+        f"different channels, got rho={rho_ab:.3f} (too high -- suggests the subgroup "
+        f"divergence was not detected)"
+    )
+
+    top1 = [chs[0] for chs in per_subject_top_k_channels(eps_matrix, channel_names, k=1)]
+    top1_a = Counter(top1[i] for i in range(len(idx)) if group_sampled[i] == "A")
+    top1_b = Counter(top1[i] for i in range(len(idx)) if group_sampled[i] == "B")
+    assert top1_a.most_common(1)[0][0] == "CH0", (
+        f"expected CH0 to be group A's most common top-1 channel, got {top1_a.most_common(3)}"
+    )
+    assert top1_b.most_common(1)[0][0] == "CH4", (
+        f"expected CH4 to be group B's most common top-1 channel, got {top1_b.most_common(3)}"
+    )
+
+
 if __name__ == "__main__":
     test_recovers_single_informative_channel_equal_scale()
     print("test_recovers_single_informative_channel_equal_scale: PASSED")
@@ -163,3 +252,5 @@ if __name__ == "__main__":
     print("test_scale_correction_needed_for_heterogeneous_amplitudes: PASSED")
     test_graph_constrained_beats_isolated_on_difference_interaction()
     print("test_graph_constrained_beats_isolated_on_difference_interaction: PASSED")
+    test_subject_adaptive_detects_subgroup_dependent_importance()
+    print("test_subject_adaptive_detects_subgroup_dependent_importance: PASSED")

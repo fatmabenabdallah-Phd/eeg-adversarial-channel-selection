@@ -175,6 +175,7 @@ def run_cgx_experiment(
     X: np.ndarray, y: np.ndarray, subject_ids: List[str], label_df: pd.DataFrame,
     channel_names: List[str] = CGX_CHANNELS, n_bands: int = N_BANDS,
     k_folds: int = 5, seed: int = 42, adversarial_max_samples: int = 40,
+    greedy_max_k: int = 10, verbose: bool = True,
     **adversarial_search_kwargs,
 ) -> pd.DataFrame:
     """Runs the full P4 comparison: for every subject-disjoint fold,
@@ -184,20 +185,49 @@ def run_cgx_experiment(
     -- so every method's fold-level score is directly comparable
     (paired), which is what makes the Wilcoxon test downstream valid.
 
+    greedy_max_k: caps greedy_forward_selection's k (default 10, NOT
+    max(CHANNEL_SUBSET_SIZES)). Greedy forward selection costs
+    k*(k+1)/2 * cv_folds RF fits -- at k=30 (this project's full
+    channel count) that is 465*5=2325 RF fits PER outer fold, ~11,625
+    total across 5 folds, which is what made an earlier version of
+    this function run for hours on real data with no visible progress.
+    Only request the largest CHANNEL_SUBSET_SIZES entries for greedy if
+    you have deliberately budgeted for this cost; the reported
+    literature baseline set (P3 of the project plan) does not require
+    testing greedy all the way to k=30 to be a valid comparison.
+
+    verbose: prints per-fold, per-step progress with elapsed time, so a
+    long real-data run is never silently unobservable (the actual
+    reason an earlier version of this run appeared "stuck" for hours
+    on real CGX data was simply the absence of this logging, not
+    necessarily a bug -- but 3+ hours with zero output is not
+    acceptable either way).
+
     Returns a long-format DataFrame with columns
     [fold, method, n_channels, balanced_accuracy, auc], one row per
     (fold, method, subset-size) evaluated.
     """
+    import time
+    t_start = time.time()
+
+    def log(msg):
+        if verbose:
+            print(f"[{time.time()-t_start:7.1f}s] {msg}", flush=True)
+
     folds = stratified_subject_kfold(label_df, k=k_folds, seed=seed)
     id_to_row = {sid: i for i, sid in enumerate(subject_ids)}
     adjacency = build_structural_knn_graph(channel_names, k=CGX_GRAPH_K)
+    log(f"Starting: {len(folds)} folds, {len(channel_names)} channels, "
+        f"greedy_max_k={greedy_max_k}, adversarial_max_samples={adversarial_max_samples}")
 
     records = []
     for fold_i, fold in enumerate(folds):
+        log(f"--- Fold {fold_i+1}/{len(folds)} ---")
         train_idx = [id_to_row[uid] for uid in fold["train_ids"] if uid in id_to_row]
         test_idx = [id_to_row[uid] for uid in fold["val_ids"] if uid in id_to_row]
         X_train, y_train = X[train_idx], y[train_idx]
         X_test, y_test = X[test_idx], y[test_idx]
+        log(f"  train={len(train_idx)} subjects, test={len(test_idx)} subjects")
 
         # Full RF on ALL channels, used only to derive channel rankings
         # (baselines + adversarial) -- never the model that produces the
@@ -207,6 +237,7 @@ def run_cgx_experiment(
         # internal notion of "using" a channel is not the same as
         # actually needing it once other channels are removed).
         full_clf = train_rf_baseline(X_train, y_train)  # returns clf only, no scaler
+        log("  full_clf trained")
 
         # --- All-channels reference ---
         result = evaluate_channel_subset(X_train, y_train, X_test, y_test, channel_names, channel_names, n_bands)
@@ -221,9 +252,14 @@ def run_cgx_experiment(
         mi_full = mutual_information_baseline(X_train, y_train, channel_names, n_bands, k=len(channel_names))
         anova_full = anova_fscore_baseline(X_train, y_train, channel_names, n_bands, k=len(channel_names))
         corr_full = correlation_baseline(X_train, y_train, channel_names, n_bands, k=len(channel_names))
+        log("  filter baselines (MI/ANOVA/corr) done")
+
         perm_full = permutation_importance_baseline(
             full_clf, X_train, y_train, channel_names, n_bands, k=len(channel_names), n_repeats=10, seed=seed
         )
+        log("  permutation_importance done")
+
+        t0 = time.time()
         adv_isolated_full = [
             row["channel_name"] for row in
             rank_channels(
@@ -231,6 +267,9 @@ def run_cgx_experiment(
                 max_samples=adversarial_max_samples, seed=seed, **adversarial_search_kwargs,
             )
         ]
+        log(f"  adversarial_isolated done ({time.time()-t0:.1f}s)")
+
+        t0 = time.time()
         adv_graph_full = [
             row["channel_name"] for row in
             rank_channels_graph_constrained(
@@ -238,6 +277,7 @@ def run_cgx_experiment(
                 max_samples=adversarial_max_samples, seed=seed, **adversarial_search_kwargs,
             )
         ]
+        log(f"  adversarial_graph_constrained done ({time.time()-t0:.1f}s)")
 
         manual = None
         try:
@@ -265,21 +305,27 @@ def run_cgx_experiment(
                     X_train, y_train, X_test, y_test, selected, channel_names, n_bands
                 )
                 records.append({"fold": fold_i, "method": method_name, **result})
+        log(f"  fixed-size baselines done for k={CHANNEL_SUBSET_SIZES}")
 
-        # --- Greedy forward selection: expensive, run once at the largest k only ---
+        # --- Greedy forward selection: expensive, capped at greedy_max_k
+        # (NOT max(CHANNEL_SUBSET_SIZES) -- see the docstring above for why) ---
+        t0 = time.time()
         from sklearn.ensemble import RandomForestClassifier
         greedy_selected = greedy_forward_selection(
             model_factory=lambda: RandomForestClassifier(
                 n_estimators=100, class_weight="balanced", random_state=seed, n_jobs=-1
             ),
             X=X_train, y=y_train, channel_names=channel_names, n_bands=n_bands,
-            k=max(CHANNEL_SUBSET_SIZES), cv_folds=5, seed=seed,
+            k=greedy_max_k, cv_folds=5, seed=seed,
         )
-        for k in CHANNEL_SUBSET_SIZES:
+        log(f"  greedy_forward (k={greedy_max_k}) done ({time.time()-t0:.1f}s)")
+
+        for k in [k for k in CHANNEL_SUBSET_SIZES if k <= greedy_max_k]:
             result = evaluate_channel_subset(
                 X_train, y_train, X_test, y_test, greedy_selected[:k], channel_names, n_bands
             )
             records.append({"fold": fold_i, "method": "greedy_forward", **result})
+        log(f"  fold {fold_i+1} complete (total elapsed {time.time()-t_start:.1f}s)")
 
     return pd.DataFrame.from_records(records)
 

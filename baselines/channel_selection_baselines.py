@@ -213,6 +213,11 @@ def greedy_forward_selection(
     from sklearn.model_selection import cross_val_score
 
     n_channels = len(channel_names)
+    if k > n_channels:
+        raise ValueError(
+            f"greedy_forward_selection: k={k} exceeds the number of available "
+            f"channels ({n_channels})."
+        )
     n_total_features = X.shape[1]
     remaining = list(range(n_channels))
     selected: List[int] = []

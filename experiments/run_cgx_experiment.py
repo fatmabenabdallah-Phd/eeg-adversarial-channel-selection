@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -175,7 +175,7 @@ def run_cgx_experiment(
     X: np.ndarray, y: np.ndarray, subject_ids: List[str], label_df: pd.DataFrame,
     channel_names: List[str] = CGX_CHANNELS, n_bands: int = N_BANDS,
     k_folds: int = 5, seed: int = 42, adversarial_max_samples: int = 40,
-    greedy_max_k: int = 10, verbose: bool = True,
+    greedy_max_k: int = 10, verbose: bool = True, checkpoint_path: Optional[str] = None,
     **adversarial_search_kwargs,
 ) -> pd.DataFrame:
     """Runs the full P4 comparison: for every subject-disjoint fold,
@@ -202,6 +202,20 @@ def run_cgx_experiment(
     on real CGX data was simply the absence of this logging, not
     necessarily a bug -- but 3+ hours with zero output is not
     acceptable either way).
+
+    checkpoint_path: if given, appends this fold's records to a CSV at
+    this path IMMEDIATELY after each fold completes (not just once at
+    the very end) -- a full run can take hours on real CGX data
+    (observed ~40-45 min/fold on the real 121-subject dataset), and
+    without incremental checkpointing, a Colab disconnect or crash
+    partway through loses every completed fold's results, not just the
+    one in progress. Safe to pass the same path across multiple runs of
+    the same experiment config: existing rows are not overwritten, new
+    fold results are appended (so re-running after a crash and
+    filtering by `fold` downstream, or simply not re-running completed
+    folds, is possible -- this function itself does not skip folds
+    already present in an existing checkpoint file, that is left to the
+    caller).
 
     Returns a long-format DataFrame with columns
     [fold, method, n_channels, balanced_accuracy, auc], one row per
@@ -325,6 +339,15 @@ def run_cgx_experiment(
                 X_train, y_train, X_test, y_test, greedy_selected[:k], channel_names, n_bands
             )
             records.append({"fold": fold_i, "method": "greedy_forward", **result})
+
+        if checkpoint_path is not None:
+            fold_df = pd.DataFrame.from_records(
+                [r for r in records if r["fold"] == fold_i]
+            )
+            write_header = not os.path.exists(checkpoint_path)
+            fold_df.to_csv(checkpoint_path, mode="a", header=write_header, index=False)
+            log(f"  fold {fold_i+1} results appended to {checkpoint_path}")
+
         log(f"  fold {fold_i+1} complete (total elapsed {time.time()-t_start:.1f}s)")
 
     return pd.DataFrame.from_records(records)

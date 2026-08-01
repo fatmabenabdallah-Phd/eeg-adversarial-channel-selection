@@ -49,19 +49,36 @@ BANDS = [
 
 
 def extract_connectivity_features(
-    epochs: np.ndarray, channel_names: List[str], sfreq: float,
+    epochs: np.ndarray, channel_names: List[str], sfreq: float, metric: str = "plv",
 ) -> np.ndarray:
     """epochs: (n_epochs, n_channels, n_samples) -- same convention as
     baselines.baselines.extract_band_power_features. Returns
     (n_epochs, n_channels * N_BANDS): for each epoch, each channel, each
-    band, the channel's MEAN PLV to every other channel (a single
-    scalar summarizing that channel's overall connectivity strength in
-    that band -- not the full pairwise matrix, to keep the exact same
-    per-channel-block shape convention as band-power features).
+    band, the channel's MEAN connectivity to every other channel (a
+    single scalar summarizing that channel's overall connectivity
+    strength in that band -- not the full pairwise matrix, to keep the
+    exact same per-channel-block shape convention as band-power
+    features).
+
+    metric: "plv" (default, Phase Locking Value) or "pli" (Phase Lag
+    Index). PLI is less sensitive to volume conduction than PLV, since
+    it discards zero-lag synchrony (a signal that spreads electrically
+    across the scalp can create spurious near-zero-lag "synchrony"
+    between nearby electrodes that has nothing to do with true neural
+    connectivity; PLV can be inflated by this, PLI is specifically
+    designed to be robust to it). Running the same channel-importance
+    analysis with metric="pli" as a robustness check against a
+    metric="plv" finding is recommended before treating any PLV-based
+    result as reliable, precisely because of this volume-conduction
+    risk.
     """
     from grn_balladeer.connectivity.phase_connectivity import (
-        extract_band_signal, compute_instantaneous_phase, compute_plv_matrix,
+        extract_band_signal, compute_instantaneous_phase, compute_plv_matrix, compute_pli_matrix,
     )
+
+    if metric not in ("plv", "pli"):
+        raise ValueError(f"extract_connectivity_features: metric must be 'plv' or 'pli', got {metric!r}")
+    compute_matrix = compute_plv_matrix if metric == "plv" else compute_pli_matrix
 
     n_epochs, n_channels, n_samples = epochs.shape
     if n_channels != len(channel_names):
@@ -77,10 +94,12 @@ def extract_connectivity_features(
         for b_idx, (band_name, lo, hi) in enumerate(BANDS):
             band_signal = extract_band_signal(epoch_data, (lo, hi), sfreq)
             phases = compute_instantaneous_phase(band_signal)
-            plv = compute_plv_matrix(phases)  # (n_channels, n_channels), diagonal = 1
-            np.fill_diagonal(plv, 0.0)  # exclude self-connectivity from the per-channel mean
-            mean_plv_per_channel = plv.mean(axis=1)  # (n_channels,) -- mean PLV to all OTHER channels
+            conn_matrix = compute_matrix(phases)  # (n_channels, n_channels)
+            np.fill_diagonal(conn_matrix, 0.0)  # exclude self-connectivity from the per-channel mean
+            # (PLV's diagonal is already 1 before this, PLI's is already 0 -- fill_diagonal(0) is a
+            # no-op for PLI and the necessary correction for PLV; harmless either way)
+            mean_conn_per_channel = conn_matrix.mean(axis=1)  # (n_channels,)
             for c in range(n_channels):
-                out[e, c * N_BANDS + b_idx] = mean_plv_per_channel[c]
+                out[e, c * N_BANDS + b_idx] = mean_conn_per_channel[c]
 
     return out

@@ -31,6 +31,9 @@ def _bandlimited_noise(n, sfreq, lo=4.0, hi=8.0, rng=None):
 
 
 def test_extract_connectivity_features_detects_independent_channel():
+    """Decision boundary: y=1 if (CH1_signal - CH2_signal) > 0 -- a
+    genuine two-channel interaction where CH1 and CH2 are structural
+    neighbors."""
     rng = np.random.RandomState(1)
     n_channels, n_samples, sfreq = 5, 2000, 250.0
     channel_names = [f"CH{i}" for i in range(n_channels)]
@@ -43,7 +46,7 @@ def test_extract_connectivity_features_detects_independent_channel():
             epochs[e, c] = shared_source + 0.3 * _bandlimited_noise(n_samples, sfreq, rng=rng)
         epochs[e, n_channels - 1] = _bandlimited_noise(n_samples, sfreq, rng=rng)
 
-    feats = extract_connectivity_features(epochs, channel_names, sfreq)
+    feats = extract_connectivity_features(epochs, channel_names, sfreq, metric="plv")
     assert feats.shape == (n_epochs, n_channels * N_BANDS)
 
     theta_band_idx = 1  # delta=0, theta=1, alpha=2, beta=3, gamma=4
@@ -55,6 +58,44 @@ def test_extract_connectivity_features_detects_independent_channel():
     )
 
 
+def test_extract_connectivity_features_pli_detects_lagged_coupling():
+    """PLI is specifically designed to be BLIND to zero-lag synchrony
+    (the exact signal design used in the PLV test above), since
+    zero-lag synchrony is the signature of volume conduction, not true
+    neural connectivity -- an earlier attempt to reuse the PLV test's
+    signal for PLI found NO contrast at all (0.108-0.117 across every
+    channel including the "independent" one), which is PLI correctly
+    doing its job, not a bug. PLI requires a genuine phase LAG between
+    coupled channels to detect a connection, which is what this test
+    constructs (each coupled channel receives the shared source shifted
+    by a different sample delay, mimicking real signal propagation)."""
+    rng = np.random.RandomState(1)
+    n_channels, n_samples, sfreq = 5, 2000, 250.0
+    channel_names = [f"CH{i}" for i in range(n_channels)]
+    lag = 8
+
+    n_epochs = 5
+    epochs = np.zeros((n_epochs, n_channels, n_samples))
+    for e in range(n_epochs):
+        pad = lag * n_channels + 10
+        shared_source = _bandlimited_noise(n_samples + pad, sfreq, rng=rng)
+        for c in range(n_channels - 1):
+            shift = lag * (c + 1)
+            epochs[e, c] = shared_source[shift:shift + n_samples] + 0.3 * _bandlimited_noise(n_samples, sfreq, rng=rng)
+        epochs[e, n_channels - 1] = _bandlimited_noise(n_samples, sfreq, rng=rng)
+
+    feats_pli = extract_connectivity_features(epochs, channel_names, sfreq, metric="pli")
+    theta_band_idx = 1
+    mean_pli_theta = feats_pli[:, theta_band_idx::N_BANDS].mean(axis=0)
+
+    assert mean_pli_theta[:4].mean() > mean_pli_theta[4] + 0.05, (
+        f"expected the lag-coupled channels (CH0-CH3) to have clearly higher theta "
+        f"PLI than the independent-noise channel (CH4), got {mean_pli_theta}"
+    )
+
+
 if __name__ == "__main__":
     test_extract_connectivity_features_detects_independent_channel()
     print("test_extract_connectivity_features_detects_independent_channel: PASSED")
+    test_extract_connectivity_features_pli_detects_lagged_coupling()
+    print("test_extract_connectivity_features_pli_detects_lagged_coupling: PASSED")

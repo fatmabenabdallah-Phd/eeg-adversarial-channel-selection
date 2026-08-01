@@ -26,7 +26,7 @@ from methods.connectivity_features import extract_connectivity_features
 
 def load_all_subjects_nasrabadi_connectivity(
     csv_path: str, sfreq: float = 128.0, window_samples: int = 512,
-    equalize_epoch_count: bool = True,
+    equalize_epoch_count: bool = True, metric: str = "plv",
 ):
     """Same loading as load_all_subjects_nasrabadi, but extracts
     PLV-based connectivity features per epoch instead of band-power.
@@ -79,7 +79,7 @@ def load_all_subjects_nasrabadi_connectivity(
         epochs_array = epochs_array[keep_idx]
         epoch_subject_ids = epoch_subject_ids[keep_idx]
 
-    connectivity_feats = extract_connectivity_features(epochs_array, NASRABADI_CHANNELS_MODERN, sfreq=sfreq)
+    connectivity_feats = extract_connectivity_features(epochs_array, NASRABADI_CHANNELS_MODERN, sfreq=sfreq, metric=metric)
     X_subject, subject_ids = aggregate_epochs_to_subject(connectivity_feats, epoch_subject_ids.tolist())
     y_subject = np.array([subject_labels[sid] for sid in subject_ids])
     return X_subject, y_subject, subject_ids

@@ -25,7 +25,7 @@ from methods.connectivity_features import extract_connectivity_features
 from preprocessing.structural_graph import build_structural_knn_graph  # noqa: F401 (re-exported for convenience)
 
 
-def load_all_subjects_cgx_connectivity(label_df: pd.DataFrame, dataset_root: str = None):
+def load_all_subjects_cgx_connectivity(label_df: pd.DataFrame, dataset_root: str = None, metric: str = "plv"):
     """Same subject/session discovery as run_cgx_experiment.load_all_subjects_cgx,
     but extracts PLV-based connectivity features per epoch instead of
     band-power. Returns (X, y, subject_ids)."""
@@ -70,7 +70,7 @@ def load_all_subjects_cgx_connectivity(label_df: pd.DataFrame, dataset_root: str
     )
 
     epochs_array = np.stack(all_epoch_tensors, axis=0)  # (n_epochs, n_channels, n_samples)
-    connectivity_feats = extract_connectivity_features(epochs_array, CGX_CHANNELS, sfreq=sfreq)
+    connectivity_feats = extract_connectivity_features(epochs_array, CGX_CHANNELS, sfreq=sfreq, metric=metric)
     X_subject, subject_ids = aggregate_epochs_to_subject(connectivity_feats, all_epoch_subject_ids)
     y_subject = np.array([all_labels_per_subject[sid] for sid in subject_ids])
     return X_subject, y_subject, subject_ids

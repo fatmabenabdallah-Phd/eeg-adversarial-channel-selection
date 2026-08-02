@@ -20,7 +20,7 @@ sys.path.insert(0, "/home/claude")  # for grn_balladeer -- see the tiret/undersc
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-from methods.connectivity_features import extract_connectivity_features, N_BANDS
+from methods.connectivity_features import extract_connectivity_features, build_functional_connectivity_graph, N_BANDS
 
 
 def _bandlimited_noise(n, sfreq, lo=4.0, hi=8.0, rng=None):
@@ -94,8 +94,38 @@ def test_extract_connectivity_features_pli_detects_lagged_coupling():
     )
 
 
+def test_build_functional_connectivity_graph_recovers_known_cluster():
+    """CH0/CH1/CH2 share a common source (a real functional cluster);
+    CH3/CH4/CH5 are mutually independent noise. The functional graph
+    must connect CH0 to at least one other cluster member, and must
+    NOT connect it to any of the independent-noise channels -- unlike
+    a geometric k-NN graph, which would connect channels based on
+    electrode position regardless of this functional structure."""
+    rng = np.random.RandomState(3)
+    n_channels, n_samples, sfreq = 6, 2000, 250.0
+    channel_names = [f"CH{i}" for i in range(n_channels)]
+
+    n_epochs = 8
+    epochs = np.zeros((n_epochs, n_channels, n_samples))
+    for e in range(n_epochs):
+        shared = _bandlimited_noise(n_samples, sfreq, rng=rng)
+        for c in [0, 1, 2]:
+            epochs[e, c] = shared + 0.3 * _bandlimited_noise(n_samples, sfreq, rng=rng)
+        for c in [3, 4, 5]:
+            epochs[e, c] = _bandlimited_noise(n_samples, sfreq, rng=rng)
+
+    adjacency = build_functional_connectivity_graph(epochs, channel_names, sfreq, k=2, metric="plv")
+
+    cluster_ok = adjacency[0, 1] == 1 or adjacency[0, 2] == 1 or adjacency[1, 2] == 1
+    no_cross = adjacency[0, 3] == 0 and adjacency[0, 4] == 0 and adjacency[0, 5] == 0
+    assert cluster_ok, f"expected CH0 to connect to at least one cluster member, got row {adjacency[0]}"
+    assert no_cross, f"expected CH0 to NOT connect to independent-noise channels, got row {adjacency[0]}"
+
+
 if __name__ == "__main__":
     test_extract_connectivity_features_detects_independent_channel()
     print("test_extract_connectivity_features_detects_independent_channel: PASSED")
     test_extract_connectivity_features_pli_detects_lagged_coupling()
     print("test_extract_connectivity_features_pli_detects_lagged_coupling: PASSED")
+    test_build_functional_connectivity_graph_recovers_known_cluster()
+    print("test_build_functional_connectivity_graph_recovers_known_cluster: PASSED")

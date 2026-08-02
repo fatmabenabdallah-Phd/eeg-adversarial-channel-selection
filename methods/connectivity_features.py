@@ -48,6 +48,82 @@ BANDS = [
 ]
 
 
+def compute_average_connectivity_matrix(
+    epochs: np.ndarray, sfreq: float, metric: str = "plv",
+) -> np.ndarray:
+    """Computes the FULL pairwise connectivity matrix (n_channels,
+    n_channels), averaged across every epoch AND every band -- unlike
+    extract_connectivity_features, which collapses each channel's
+    connectivity down to a single per-band scalar (its mean to all
+    others) for reuse in the band-power-shaped pipeline. This function
+    keeps the full pairwise structure, needed to build a FUNCTIONAL
+    connectivity graph (build_functional_connectivity_graph) instead
+    of a geometric one.
+    """
+    from grn_balladeer.connectivity.phase_connectivity import (
+        extract_band_signal, compute_instantaneous_phase, compute_plv_matrix, compute_pli_matrix,
+    )
+
+    if metric not in ("plv", "pli"):
+        raise ValueError(f"compute_average_connectivity_matrix: metric must be 'plv' or 'pli', got {metric!r}")
+    compute_matrix = compute_plv_matrix if metric == "plv" else compute_pli_matrix
+
+    n_epochs, n_channels, n_samples = epochs.shape
+    accum = np.zeros((n_channels, n_channels))
+
+    for e in range(n_epochs):
+        epoch_data = epochs[e]
+        for band_name, lo, hi in BANDS:
+            band_signal = extract_band_signal(epoch_data, (lo, hi), sfreq)
+            phases = compute_instantaneous_phase(band_signal)
+            conn_matrix = compute_matrix(phases)
+            np.fill_diagonal(conn_matrix, 0.0)
+            accum += conn_matrix
+
+    return accum / (n_epochs * len(BANDS))
+
+
+def build_functional_connectivity_graph(
+    epochs: np.ndarray, channel_names: List[str], sfreq: float, k: int = 4, metric: str = "plv",
+) -> np.ndarray:
+    """Builds a k-NN adjacency matrix (same binary format as
+    preprocessing.structural_graph.build_structural_knn_graph, a
+    drop-in replacement for it in
+    methods.adversarial_importance.rank_channels_graph_constrained)
+    where a channel's "neighbors" are its k MOST FUNCTIONALLY CONNECTED
+    channels (highest average PLV/PLI), not its k geometrically
+    nearest electrodes.
+
+    Rationale: the geometric k-NN graph is motivated by the assumption
+    that spatially adjacent electrodes are the ones whose perturbation
+    should be coupled -- a reasonable assumption for POWER features
+    (nearby electrodes tend to pick up correlated volume-conducted
+    signal), but not obviously appropriate for CONNECTIVITY features,
+    where two channels can be strongly functionally coupled despite
+    being geometrically distant (e.g. long-range fronto-parietal
+    coupling), and geometrically adjacent channels are not
+    automatically functionally coupled. Perturbing a channel jointly
+    with its geometric neighbors, when the real interaction structure
+    is functional rather than spatial, would be testing the wrong
+    hypothesis about which channels interact.
+    """
+    avg_matrix = compute_average_connectivity_matrix(epochs, sfreq, metric=metric)
+    n_channels = len(channel_names)
+    if avg_matrix.shape != (n_channels, n_channels):
+        raise ValueError(
+            f"build_functional_connectivity_graph: connectivity matrix shape {avg_matrix.shape} "
+            f"does not match n_channels={n_channels}."
+        )
+
+    adjacency = np.zeros((n_channels, n_channels))
+    for c in range(n_channels):
+        # Top-k most functionally connected OTHER channels (diagonal already 0)
+        neighbor_idx = np.argsort(avg_matrix[c])[::-1][:k]
+        adjacency[c, neighbor_idx] = 1
+
+    return adjacency
+
+
 def extract_connectivity_features(
     epochs: np.ndarray, channel_names: List[str], sfreq: float, metric: str = "plv",
 ) -> np.ndarray:

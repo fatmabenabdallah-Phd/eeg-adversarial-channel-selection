@@ -80,8 +80,22 @@ def build_tdbrain_label_df(
         "label": filtered["formal_status"].isin(["ADHD", "ADD"]).astype(int).values,
         "age": filtered["age"].values,
         "gender": filtered["gender"].values,
-    })
-    return label_df.reset_index(drop=True)
+    }).reset_index(drop=True)
+
+    n_before_dedup = len(label_df)
+    n_duplicate_ids = n_before_dedup - label_df["user_id"].nunique()
+    if n_duplicate_ids > 0:
+        dup_ids = label_df[label_df.duplicated(subset="user_id", keep=False)]["user_id"].unique()
+        print(
+            f"Found {n_duplicate_ids} duplicate user_id rows in the participants file "
+            f"(subjects: {list(dup_ids)}) -- likely repeated clinical assessments (e.g. pre/post "
+            f"treatment) referencing the SAME single EEG session (this project's TDBRAIN loader "
+            f"only reads ses-1). Keeping the first row per subject and dropping the rest, so the "
+            f"EEG-loading step doesn't redundantly reload and average the identical file with itself."
+        )
+        label_df = label_df.drop_duplicates(subset="user_id", keep="first").reset_index(drop=True)
+
+    return label_df
 
 
 if __name__ == "__main__":

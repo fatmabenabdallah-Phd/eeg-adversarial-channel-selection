@@ -63,6 +63,71 @@ def _channel_test_statistic(X_channel_block: np.ndarray, y: np.ndarray) -> float
     return float((mean_diff_sq / pooled_var).sum())
 
 
+def _channel_regression_statistic(X_channel_block: np.ndarray, y: np.ndarray) -> float:
+    """Test statistic for one channel's feature block (n_subjects,
+    n_bands) against a CONTINUOUS target: sum, across the channel's
+    bands, of the squared Pearson correlation between that band's
+    feature and y -- the regression analogue of
+    _channel_test_statistic's group-mean-difference statistic (both
+    are "explained variance" style, aggregated across bands, just
+    using correlation instead of a standardized mean difference since
+    y is continuous here, not a 0/1 label)."""
+    n_bands = X_channel_block.shape[1]
+    stat = 0.0
+    y_std = y.std()
+    if y_std == 0:
+        return 0.0
+    for b in range(n_bands):
+        col = X_channel_block[:, b]
+        col_std = col.std()
+        if col_std == 0:
+            continue
+        r = np.corrcoef(col, y)[0, 1]
+        if r == r:  # not NaN
+            stat += r ** 2
+    return float(stat)
+
+
+def permutation_screen_channels_regression(
+    X: np.ndarray, y: np.ndarray, channel_names: List[str], n_bands: int,
+    n_permutations: int = 5000, seed: int = 42,
+) -> "np.ndarray":
+    """Regression analogue of permutation_screen_channels, for a
+    CONTINUOUS target y (e.g. TDBRAIN's ADHD_pre_Att_leading severity
+    score) instead of a binary 0/1 label. Same permutation-null design
+    (shuffle y, recompute every channel's statistic under each
+    shuffle), same output format (channel_name, observed_stat,
+    p_value), same no-FDR-applied-here convention (composable with
+    this project's existing multipletests-based correction step).
+    """
+    rng = np.random.RandomState(seed)
+    n_channels = len(channel_names)
+    n_total_features = X.shape[1]
+
+    observed_stats = np.zeros(n_channels)
+    for c in range(n_channels):
+        ch_slice = _channel_feature_slice(c, n_bands, n_total_features)
+        observed_stats[c] = _channel_regression_statistic(X[:, ch_slice], y)
+
+    exceed_counts = np.zeros(n_channels)
+    for p in range(n_permutations):
+        y_perm = rng.permutation(y)
+        for c in range(n_channels):
+            ch_slice = _channel_feature_slice(c, n_bands, n_total_features)
+            perm_stat = _channel_regression_statistic(X[:, ch_slice], y_perm)
+            if perm_stat >= observed_stats[c]:
+                exceed_counts[c] += 1
+
+    p_values = (exceed_counts + 1) / (n_permutations + 1)
+
+    dtype = [("channel_name", "U16"), ("observed_stat", "f8"), ("p_value", "f8")]
+    out = np.zeros(n_channels, dtype=dtype)
+    out["channel_name"] = channel_names
+    out["observed_stat"] = observed_stats
+    out["p_value"] = p_values
+    return np.sort(out, order="p_value")
+
+
 def permutation_screen_channels(
     X: np.ndarray, y: np.ndarray, channel_names: List[str], n_bands: int,
     n_permutations: int = 5000, seed: int = 42,
